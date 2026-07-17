@@ -12,6 +12,7 @@
 Це навмисно просто (SQLite, без ORM) — легко читати, легко міняти на
 Postgres пізніше, якщо буде потрібно.
 """
+import os
 import time
 import aiosqlite
 
@@ -44,6 +45,9 @@ class Memory:
         self.db_path = db_path
 
     async def init(self) -> None:
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
         async with aiosqlite.connect(self.db_path) as db:
             await db.executescript(SCHEMA)
             await db.commit()
