@@ -5,6 +5,8 @@ handlers лише координують Memory + ClaudeClient, вся "бізн
 """
 import asyncio
 import logging
+import time
+from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -14,6 +16,8 @@ from app.config import settings
 from app.memory import Memory
 from app.claude_client import ClaudeClient
 from app.voice import VoiceTranscriber
+from app.reminders import Reminders
+from app.remind_parser import parse_remind
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,6 +25,7 @@ logger = logging.getLogger(__name__)
 memory = Memory(settings.db_path)
 claude = ClaudeClient(settings.anthropic_api_key)
 transcriber = VoiceTranscriber(settings.openai_api_key) if settings.openai_api_key else None
+reminders = Reminders(settings.db_path)
 
 dp = Dispatcher()
 
@@ -38,7 +43,14 @@ async def cmd_start(message: Message) -> None:
         "Команди:\n"
         "/remember <текст> — запам'ятати факт надовго\n"
         "/facts — показати, що я про тебе пам'ятаю\n"
-        "/forget_all — очистити коротку історію цього чату"
+        "/forget_all — очистити коротку історію цього чату\n\n"
+        "Нагадування:\n"
+        "/remind 30m Текст — нагадати через 30 хвилин\n"
+        "/remind 2h Текст — через 2 години\n"
+        "/remind 1d Текст — через 1 день\n"
+        "/remind 17.07.2026 15:30 Текст — на конкретну дату й час\n"
+        "/reminders — список активних нагадувань\n"
+        "/cancel_reminder <номер> — скасувати нагадування"
     )
 
 
@@ -72,6 +84,59 @@ async def cmd_forget_all(message: Message) -> None:
         return
     await memory.clear_history(message.chat.id)
     await message.answer("Коротку історію цього чату очищено.")
+
+
+@dp.message(Command("remind"))
+async def cmd_remind(message: Message) -> None:
+    if not is_allowed(message.from_user.id):
+        return
+    args = message.text.removeprefix("/remind").strip()
+    parsed = parse_remind(args)
+    if parsed is None:
+        await message.answer(
+            "Не розпізнав формат. Приклади:\n"
+            "/remind 30m Подзвонити клієнту\n"
+            "/remind 2h Забрати посилку\n"
+            "/remind 17.07.2026 15:30 Зустріч"
+        )
+        return
+    due_at, text = parsed
+    if due_at <= time.time():
+        await message.answer("Цей час вже минув — вкажи час у майбутньому.")
+        return
+    reminder_id = await reminders.add(message.chat.id, due_at, text)
+    due_str = datetime.fromtimestamp(due_at).strftime("%d.%m.%Y %H:%M")
+    await message.answer(f"Домовились, нагадаю {due_str} (№{reminder_id}): {text}")
+
+
+@dp.message(Command("reminders"))
+async def cmd_reminders(message: Message) -> None:
+    if not is_allowed(message.from_user.id):
+        return
+    upcoming = await reminders.get_upcoming(message.chat.id)
+    if not upcoming:
+        await message.answer("Активних нагадувань немає.")
+        return
+    lines = []
+    for r in upcoming:
+        due_str = datetime.fromtimestamp(r["due_at"]).strftime("%d.%m.%Y %H:%M")
+        lines.append(f"№{r['id']} — {due_str} — {r['text']}")
+    await message.answer("Активні нагадування:\n" + "\n".join(lines))
+
+
+@dp.message(Command("cancel_reminder"))
+async def cmd_cancel_reminder(message: Message) -> None:
+    if not is_allowed(message.from_user.id):
+        return
+    arg = message.text.removeprefix("/cancel_reminder").strip()
+    if not arg.isdigit():
+        await message.answer("Напиши так: /cancel_reminder 3 (номер із /reminders)")
+        return
+    removed = await reminders.cancel(message.chat.id, int(arg))
+    if removed:
+        await message.answer("Нагадування скасовано.")
+    else:
+        await message.answer("Не знайшов нагадування з таким номером у цьому чаті.")
 
 
 async def generate_reply(chat_id: int, user_id: int, user_text: str) -> str:
@@ -141,12 +206,35 @@ async def handle_voice(message: Message, bot: Bot) -> None:
     await message.answer(f"🎤 Я почув: «{recognized_text}»\n\n{reply_text}")
 
 
+REMINDER_CHECK_INTERVAL_SECONDS = 30
+
+
+async def reminder_check_loop(bot: Bot) -> None:
+    """Фоновий цикл: раз на REMINDER_CHECK_INTERVAL_SECONDS перевіряє, чи є
+    прострочені нагадування, і надсилає їх у відповідний чат."""
+    while True:
+        try:
+            due = await reminders.get_due(time.time())
+            for r in due:
+                try:
+                    await bot.send_message(r["chat_id"], f"🔔 Нагадування: {r['text']}")
+                except Exception:
+                    logger.exception("Failed to send reminder %s", r["id"])
+                await reminders.mark_sent(r["id"])
+        except Exception:
+            logger.exception("Reminder check loop failed")
+        await asyncio.sleep(REMINDER_CHECK_INTERVAL_SECONDS)
+
+
 async def main() -> None:
     settings.validate()
     await memory.init()
+    await reminders.init()
 
     bot = Bot(token=settings.telegram_bot_token)
     logger.info("Bot starting...")
+
+    asyncio.create_task(reminder_check_loop(bot))
     await dp.start_polling(bot)
 
 
