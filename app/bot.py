@@ -169,32 +169,62 @@ async def cmd_cancel_reminder(message: Message) -> None:
         await message.answer("Не знайшов нагадування з таким номером у цьому чаті.")
 
 
-async def generate_reply(chat_id: int, user_id: int, user_text: str) -> str:
-    """Спільна логіка: зберегти повідомлення користувача, звернутись до Claude,
-    зберегти й повернути відповідь. Використовується і текстовим, і голосовим
-    обробниками, щоб не дублювати код."""
-    await memory.add_message(chat_id, "user", user_text)
+async def record_message(chat_id: int, role: str, text: str) -> None:
+    await memory.add_message(chat_id, role, text)
 
+
+async def produce_reply(chat_id: int, user_id: int) -> str:
+    """Читає вже наявну історію й факти та звертається до Claude. Використовується,
+    коли повідомлення користувача вже збережено окремо (record_message) —
+    наприклад, у груповому чаті."""
     history = await memory.get_history(chat_id)
     facts = await memory.get_facts(user_id)
-
     reply_text = await claude.reply(history, facts)
-
     await memory.add_message(chat_id, "assistant", reply_text)
     return reply_text
 
 
+async def generate_reply(chat_id: int, user_id: int, user_text: str) -> str:
+    """Спільна логіка для приватних чатів: зберегти повідомлення користувача,
+    звернутись до Claude, зберегти й повернути відповідь."""
+    await record_message(chat_id, "user", user_text)
+    return await produce_reply(chat_id, user_id)
+
+
+def format_sender_label(message: Message) -> str:
+    """Формує підпис відправника для збереження в спільній історії групи,
+    щоб бот міг розрізняти, хто саме що написав (включно з іншими ботами)."""
+    user = message.from_user
+    if user is None:
+        return "Учасник"
+    name = user.full_name or user.username or "Учасник"
+    return f"[Бот] {name}" if user.is_bot else name
+
+
 @dp.message(F.text)
 async def handle_text(message: Message) -> None:
-    if not is_allowed(message.from_user.id):
-        if not is_group_chat(message):
-            await message.answer("У тебе немає доступу до цього бота.")
+    user_text = strip_mention(message.text)
+
+    if is_group_chat(message):
+        sender_label = format_sender_label(message)
+        await record_message(message.chat.id, "user", f"{sender_label}: {user_text}")
+
+        if not is_allowed(message.from_user.id) or not should_respond_in_group(message):
+            return  # мовчимо: або немає доступу, або нас не покликали
+
+        try:
+            reply_text = await produce_reply(message.chat.id, message.from_user.id)
+        except Exception:
+            logger.exception("Claude API call failed")
+            await message.answer("Сталася помилка при зверненні до Claude. Спробуй ще раз.")
+            return
+
+        await message.answer(reply_text)
         return
 
-    if is_group_chat(message) and not should_respond_in_group(message):
-        return  # у групі мовчимо, якщо нас не покликали
-
-    user_text = strip_mention(message.text)
+    if not is_allowed(message.from_user.id):
+        await message.answer("У тебе немає доступу до цього бота.")
+        return
 
     try:
         reply_text = await generate_reply(message.chat.id, message.from_user.id, user_text)
