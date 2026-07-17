@@ -20,6 +20,7 @@ def _parse_allowed_ids(raw: str) -> set[int]:
 class Settings:
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
+    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")  # потрібен лише для голосових
     db_path: str = os.getenv("DB_PATH", "data/assistant.db")
     allowed_user_ids: set[int] = field(
         default_factory=lambda: _parse_allowed_ids(os.getenv("ALLOWED_USER_IDS", ""))
