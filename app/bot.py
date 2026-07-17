@@ -29,11 +29,41 @@ reminders = Reminders(settings.db_path)
 
 dp = Dispatcher()
 
+# Заповнюється в main() перед стартом polling — потрібен, щоб розпізнавати
+# згадки бота (@ім'я_бота) у групових чатах.
+BOT_USERNAME: str | None = None
+
 
 def is_allowed(user_id: int) -> bool:
     if not settings.allowed_user_ids:
         return True  # доступ не обмежено (лише для тестового етапу)
     return user_id in settings.allowed_user_ids
+
+
+def is_group_chat(message: Message) -> bool:
+    return message.chat.type in ("group", "supergroup")
+
+
+def should_respond_in_group(message: Message) -> bool:
+    """У групах бот відповідає лише якщо його явно покликали:
+    згадали через @ім'я_бота або відповіли на його повідомлення.
+    Інакше він мовчки читає далі, не втручаючись у кожну розмову.
+
+    (Насправді Telegram у режимі Privacy Mode й так надсилає боту лише
+    такі повідомлення — ця перевірка є додатковим запобіжником.)"""
+    reply = message.reply_to_message
+    if reply and reply.from_user and reply.from_user.is_bot:
+        if BOT_USERNAME and reply.from_user.username == BOT_USERNAME:
+            return True
+    if message.text and BOT_USERNAME and f"@{BOT_USERNAME}" in message.text:
+        return True
+    return False
+
+
+def strip_mention(text: str) -> str:
+    if BOT_USERNAME:
+        return text.replace(f"@{BOT_USERNAME}", "").strip()
+    return text
 
 
 @dp.message(Command("start"))
@@ -157,11 +187,17 @@ async def generate_reply(chat_id: int, user_id: int, user_text: str) -> str:
 @dp.message(F.text)
 async def handle_text(message: Message) -> None:
     if not is_allowed(message.from_user.id):
-        await message.answer("У тебе немає доступу до цього бота.")
+        if not is_group_chat(message):
+            await message.answer("У тебе немає доступу до цього бота.")
         return
 
+    if is_group_chat(message) and not should_respond_in_group(message):
+        return  # у групі мовчимо, якщо нас не покликали
+
+    user_text = strip_mention(message.text)
+
     try:
-        reply_text = await generate_reply(message.chat.id, message.from_user.id, message.text)
+        reply_text = await generate_reply(message.chat.id, message.from_user.id, user_text)
     except Exception:
         logger.exception("Claude API call failed")
         await message.answer("Сталася помилка при зверненні до Claude. Спробуй ще раз.")
@@ -173,8 +209,12 @@ async def handle_text(message: Message) -> None:
 @dp.message(F.voice)
 async def handle_voice(message: Message, bot: Bot) -> None:
     if not is_allowed(message.from_user.id):
-        await message.answer("У тебе немає доступу до цього бота.")
+        if not is_group_chat(message):
+            await message.answer("У тебе немає доступу до цього бота.")
         return
+
+    if is_group_chat(message) and not should_respond_in_group(message):
+        return  # у групі реагуємо на голос лише якщо відповіли на повідомлення бота
 
     if transcriber is None:
         await message.answer(
@@ -227,12 +267,15 @@ async def reminder_check_loop(bot: Bot) -> None:
 
 
 async def main() -> None:
+    global BOT_USERNAME
     settings.validate()
     await memory.init()
     await reminders.init()
 
     bot = Bot(token=settings.telegram_bot_token)
-    logger.info("Bot starting...")
+    me = await bot.get_me()
+    BOT_USERNAME = me.username
+    logger.info("Bot starting as @%s...", BOT_USERNAME)
 
     asyncio.create_task(reminder_check_loop(bot))
     await dp.start_polling(bot)
