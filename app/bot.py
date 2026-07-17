@@ -203,9 +203,26 @@ def format_sender_label(message: Message) -> str:
 
 @dp.message(F.text)
 async def handle_text(message: Message) -> None:
+    # ТИМЧАСОВЕ ДІАГНОСТИЧНЕ ЛОГУВАННЯ — покаже в Railway Deploy Logs
+    # АБСОЛЮТНО кожне повідомлення, яке Telegram взагалі надсилає боту,
+    # включно з тим, від кого воно. Приберемо після перевірки.
+    sender = message.from_user
+    logger.info(
+        "RAW UPDATE: chat_id=%s chat_type=%s from_id=%s from_username=%s is_bot=%s text=%r",
+        message.chat.id,
+        message.chat.type,
+        sender.id if sender else None,
+        sender.username if sender else None,
+        sender.is_bot if sender else None,
+        message.text,
+    )
+
     user_text = strip_mention(message.text)
 
     if is_group_chat(message):
+        # У групі зберігаємо КОЖНЕ повідомлення (включно з іншими ботами)
+        # для контексту, навіть якщо зараз не відповідаємо на нього —
+        # це дозволяє боту "пам'ятати" все, що відбувалось у чаті.
         sender_label = format_sender_label(message)
         await record_message(message.chat.id, "user", f"{sender_label}: {user_text}")
 
